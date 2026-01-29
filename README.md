@@ -1,165 +1,204 @@
 # Epidemiology-Informed Spatio-Temporal Graph Neural Network for Dengue Prediction
 
-基于流行病学知识的时空图神经网络模型，用于预测台湾地区登革热病例数。
+An epidemiology-informed spatio-temporal graph neural network model for predicting dengue fever cases in Taiwan.
 
-## 模型架构
+## Model Architecture
 
-### 核心组件
+### Core Components
 
-1. **空间建模 (GCN)**: 使用图卷积网络捕获城市间的空间相关性
-2. **时间建模 (LSTM)**: 使用LSTM捕获时间序列的时序模式
-3. **SIS正则化**: 使用SIS (Susceptible-Infected-Susceptible) 动力学模型作为软约束
+1. **Spatial Modeling**: Graph-based spatial attention mechanism to capture inter-city spatial correlations
+2. **Temporal Modeling**: Multi-scale temporal encoder with positional encoding and LSTM for temporal pattern learning
+3. **SIS Regularization**: SIS (Susceptible-Infected-Susceptible) dynamics model as a soft constraint
 
-### 模型特点
+### Key Features
 
-- **混合建模**: 数据驱动 + 机制先验
-- **软约束**: 不强制遵循流行病学方程，但通过正则化引导
-- **可解释性**: 显式的疾病动力学
-- **可扩展性**: 支持可学习的SIS参数、城市特定参数、移动性信息图等
+- **Hybrid Modeling**: Combines data-driven learning with epidemiological priors
+- **Multi-Scale Temporal Processing**: Captures patterns at different time scales (3, 7, 14, 30 days)
+- **Attention Mechanisms**: Both spatial and temporal attention for improved feature extraction
+- **Soft Constraints**: Epidemiological dynamics guide learning without hard constraints
+- **Interpretability**: Explicit disease dynamics modeling
+- **Extensibility**: Supports learnable SIS parameters, city-specific parameters, and mobility information
 
-## 文件结构
+## Project Structure
 
 ```
 .
-├── Dengue_Daily_EN.csv          # 原始数据
-├── data_preprocessing.py         # 数据预处理脚本
-├── model.py                      # 模型定义
-├── train.py                      # 训练脚本
-└── README.md                     # 说明文档
+├── Dengue_Daily_EN.csv          # Raw data
+├── data_preprocessing.py         # Data preprocessing script
+├── model.py                      # Model definition (EpidemiologyGNNv2)
+├── train.py                      # Training script with advanced loss functions
+├── inference.py                  # Single/multi-day prediction
+├── visualize_results.py          # Result visualization
+├── comprehensive_evaluation.py   # Comprehensive model evaluation
+├── multi_step_evaluation.py      # Multi-step forecasting evaluation
+├── run_pipeline.py               # One-click pipeline runner
+└── README.md                     # Documentation
 ```
 
-## 快速开始
+## Quick Start
 
-### 方式1: 一键运行完整管道
+### Option 1: One-Click Pipeline
 
 ```bash
 python run_pipeline.py
 ```
 
-这将自动执行：
-1. 数据预处理
-2. 模型训练
-3. 结果可视化
+This will automatically execute:
+1. Data preprocessing
+2. Model training
+3. Result visualization
 
-### 方式2: 分步执行
+### Option 2: Step-by-Step Execution
 
-#### 步骤1: 数据预处理
+#### Step 1: Data Preprocessing
 
 ```bash
 python data_preprocessing.py
 ```
 
-这将：
-- 加载原始CSV数据
-- 按城市和日期聚合病例数
-- 创建时间序列样本
-- 划分训练/验证/测试集
-- 保存预处理后的数据到 `processed_data.pkl`
+This will:
+- Load raw CSV data
+- Aggregate cases by city and date
+- Create time series samples using sliding windows
+- Split into train/validation/test sets (2000-2020 for training, 2020-2024 for testing)
+- Save preprocessed data to `processed_data.pkl`
 
-#### 步骤2: 训练模型
+#### Step 2: Train Model
 
 ```bash
 python train.py
 ```
 
-训练过程将：
-- 加载预处理后的数据
-- 创建全连接图结构
-- 初始化模型
-- 训练模型（包含SIS正则化）
-- 保存最佳模型和训练曲线
+The training process will:
+- Load preprocessed data
+- Create fully-connected graph structure
+- Initialize the EpidemiologyGNNv2 model
+- Train with combined loss (MSE + MAE + Outbreak-weighted + SIS consistency)
+- Use mixed precision training (AMP) for efficiency
+- Apply early stopping and cosine annealing learning rate schedule
+- Save best model and training curves
 
-#### 步骤3: 可视化结果
+#### Step 3: Visualize Results
 
 ```bash
 python visualize_results.py
 ```
 
-这将生成：
-- 预测值 vs 真实值对比图
-- 时间序列预测图
-- 误差分布图
+This generates:
+- MAE/RMSE metrics by city for different forecast horizons (3, 7, 14, 30 days)
+- Time series prediction plots for each city
+- Horizon comparison plots (2x2 grid for each city)
+- All outputs are saved to `visualization_results/`
 
-#### 步骤4: 使用模型进行预测
+#### Step 4: Run Inference
 
 ```bash
-# 使用测试集数据预测未来7天
+# Predict using test data for 7 days ahead
 python inference.py --checkpoint checkpoints/best_model.pth --days 7 --use_test_data
 ```
 
-### 3. 模型配置
+## Model Configuration
 
-可以在 `train.py` 中修改以下配置：
+You can modify the following configurations in `train.py`:
 
 ```python
 config = {
-    'batch_size': 32,
-    'learning_rate': 0.001,
-    'num_epochs': 50,
-    'lambda_sis': 0.1,          # SIS正则化权重
-    'gcn_hidden_dim': 64,
-    'gcn_num_layers': 2,
-    'lstm_hidden_dim': 128,
-    'lstm_num_layers': 2,
-    'dropout': 0.1,
+    'batch_size': 512,
+    'learning_rate': 5e-4,
+    'min_lr': 1e-6,
+    'weight_decay': 1e-5,
+    'num_epochs': 300,
+    'patience': 50,              # Early stopping patience
+    'grad_clip': 1.0,
+    
+    # Loss weights
+    'lambda_mae': 0.5,
+    'lambda_outbreak': 0.3,
+    'lambda_sis': 0.05,
+    
+    # Model architecture
+    'spatial_hidden_dim': 128,
+    'temporal_hidden_dim': 256,
+    'num_spatial_layers': 3,
+    'num_temporal_layers': 3,
+    'dropout': 0.15,
     'use_sis': True,
-    'learnable_sis_params': True
+    'use_amp': True,             # Mixed precision training
 }
 ```
 
-## 模型架构详解
+## Model Architecture Details
 
-### 输入输出
+### Input/Output
 
-- **输入**: `X ∈ R^(B×w×N)`，其中B是批次大小，w是时间窗口大小，N是城市数量
-- **输出**: `Î_{t+1} ∈ R^N`，预测的下一个时间步的病例数
+- **Input**: `X ∈ R^(B×w×N)` where B is batch size, w is window size (14 days default), N is number of cities
+- **Output**: `Î_{t+1} ∈ R^N`, predicted case counts for the next time step
 
-### 损失函数
+### Loss Function
 
-总损失 = 数据保真度损失 + λ × SIS一致性损失
+Total Loss = MSE Loss + λ_mae × MAE Loss + λ_outbreak × Outbreak Loss + λ_sis × SIS Consistency Loss
 
 ```
-L = L_data + λ × L_SIS
+L = L_MSE + λ_mae × L_MAE + λ_outbreak × L_outbreak + λ_sis × L_SIS
 ```
 
-其中：
-- `L_data = ||Î_{t+1} - I_{t+1}||²`
-- `L_SIS = ||Î_{t+1} - I_{t+1}^{SIS}||²`
+Where:
+- `L_MSE`: Mean Squared Error on log-transformed predictions
+- `L_MAE`: Mean Absolute Error for robustness
+- `L_outbreak`: Weighted loss emphasizing outbreak periods
+- `L_SIS`: Consistency with SIS dynamics model
 
-### SIS动力学模型
+### SIS Dynamics Model
 
 ```
 I_{t+1}^{SIS} = I_t + β(N - I_t)I_t/N - γI_t
 ```
 
-其中：
-- `I_t`: 当前感染比例
-- `β`: 感染率
-- `γ`: 恢复率
-- `N`: 总人口（归一化为1）
+Where:
+- `I_t`: Current infection ratio
+- `β`: Infection rate (learnable)
+- `γ`: Recovery rate (learnable)
+- `N`: Total population (normalized to 1)
 
-## 输出文件
+## Output Files
 
-训练完成后，将生成以下文件：
+After training, the following files are generated:
 
-- `processed_data.pkl`: 预处理后的数据
-- `checkpoints/best_model.pth`: 最佳模型权重
-- `checkpoints/test_results.pkl`: 测试集结果
-- `training_curves.png`: 训练曲线图
+- `processed_data.pkl`: Preprocessed data
+- `checkpoints/best_model.pth`: Best model weights with scaler information
+- `checkpoints/test_results.pkl`: Test set results
+- `checkpoints/training_curves.png`: Training curves
+- `visualization_results/`: Visualization outputs
+  - `fig1_*.png`: MAE/RMSE metrics by city and horizon
+  - `city_predictions/`: Per-city prediction plots
 
-## 扩展方向
+## Evaluation Metrics
 
-1. **距离加权图**: 使用城市间距离构建加权图
-2. **移动性图**: 使用人口流动数据构建图
-3. **多室模型**: 扩展到SEIR等更复杂的模型
-4. **城市特定参数**: 为每个城市学习不同的SIS参数
-5. **外部特征**: 加入天气、温度等外部特征
+The model is evaluated using:
+- **MAE** (Mean Absolute Error)
+- **RMSE** (Root Mean Square Error)
+- **MAPE** (Mean Absolute Percentage Error)
+- **R²** (Coefficient of Determination)
 
-## 引用
+## Future Directions
 
-如果使用本代码，请引用相关论文。
+1. **Distance-Weighted Graphs**: Use geographic distance for weighted graph construction
+2. **Mobility Graphs**: Incorporate population flow data
+3. **Multi-Compartment Models**: Extend to SEIR and other complex models
+4. **City-Specific Parameters**: Learn different SIS parameters per city
+5. **External Features**: Include weather, temperature, and other environmental factors
+6. **Uncertainty Quantification**: Add prediction intervals
 
-## 许可证
+## Requirements
+
+- Python 3.8+
+- PyTorch 2.0+
+- NumPy
+- Pandas
+- Matplotlib
+- scikit-learn
+- tqdm
+
+## License
 
 MIT License
-

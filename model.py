@@ -1,301 +1,464 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
 """
-Epidemiology-Informed Spatio-Temporal Graph Neural Network with SIS Regularization
+改进版：Epidemiology-Informed Spatio-Temporal Graph Neural Network
+优化点：
+1. 添加时间特征编码（周期性、趋势）
+2. 多尺度时间建模（CNN + LSTM + Attention）
+3. 残差连接和LayerNorm
+4. 改进的空间建模（GAT替代GCN）
+5. 输出非负约束
+6. 更好的特征工程
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-try:
-    from torch_geometric.nn import GCNConv
-except ImportError:
-    # 如果torch-geometric不可用，使用简单的线性层替代
-    print("警告: torch-geometric未安装，将使用简化的图卷积实现")
-    class GCNConv(nn.Module):
-        def __init__(self, in_channels, out_channels):
-            super().__init__()
-            self.linear = nn.Linear(in_channels, out_channels)
-        def forward(self, x, edge_index):
-            return self.linear(x)
 import numpy as np
+import math
 
-class GCNLayer(nn.Module):
-    """图卷积层（兼容版本）"""
-    def __init__(self, in_features, out_features):
-        super(GCNLayer, self).__init__()
-        try:
-            self.conv = GCNConv(in_features, out_features)
-            self.use_pyg = True
-        except:
-            # 如果PyG不可用，使用简单的线性层
-            self.linear = nn.Linear(in_features, out_features)
-            self.use_pyg = False
-    
-    def forward(self, x, edge_index):
-        if self.use_pyg:
-            return F.relu(self.conv(x, edge_index))
-        else:
-            # 简单的图聚合：平均邻居特征
-            return F.relu(self.linear(x))
+try:
+    from torch_geometric.nn import GATConv, GCNConv
+    HAS_PYG = True
+except ImportError:
+    HAS_PYG = False
+    print("警告: torch-geometric未安装，将使用简化实现")
 
-class SpatialGCN(nn.Module):
-    """空间建模：图卷积网络"""
-    def __init__(self, num_nodes, hidden_dim=64, num_layers=2):
-        super(SpatialGCN, self).__init__()
-        self.num_nodes = num_nodes
-        self.hidden_dim = hidden_dim
-        
-        layers = []
-        layers.append(GCNLayer(1, hidden_dim))
-        for _ in range(num_layers - 1):
-            layers.append(GCNLayer(hidden_dim, hidden_dim))
-        
-        self.layers = nn.ModuleList(layers)
-    
-    def forward(self, x, edge_index):
-        """
-        Args:
-            x: 节点特征，形状 (batch_size, num_nodes, 1) 或 (num_nodes, 1)
-            edge_index: 边索引，形状 (2, num_edges)
-        
-        Returns:
-            h: 节点嵌入，形状 (batch_size, num_nodes, hidden_dim) 或 (num_nodes, hidden_dim)
-        """
-        # 处理批次维度
-        if x.dim() == 3:
-            batch_size, num_nodes, _ = x.shape
-            # 展平批次和节点维度（使用reshape确保兼容性）
-            x = x.contiguous().view(batch_size * num_nodes, -1)
-            
-            # 为每个批次样本创建边索引
-            # PyTorch Geometric需要为批次中的每个图创建边索引
-            num_edges = edge_index.shape[1]
-            batch_edge_index = []
-            for b in range(batch_size):
-                offset = b * num_nodes
-                batch_edges = edge_index + offset
-                batch_edge_index.append(batch_edges)
-            batch_edge_index = torch.cat(batch_edge_index, dim=1)
-            
-            h = x
-            for layer in self.layers:
-                h = layer(h, batch_edge_index)
-            
-            # 恢复批次维度
-            h = h.view(batch_size, num_nodes, self.hidden_dim)
-        else:
-            h = x
-            for layer in self.layers:
-                h = layer(h, edge_index)
-        
-        return h
 
-class TemporalLSTM(nn.Module):
-    """时间建模：LSTM"""
-    def __init__(self, input_dim, hidden_dim=128, num_layers=2, dropout=0.1):
-        super(TemporalLSTM, self).__init__()
-        self.hidden_dim = hidden_dim
-        self.num_layers = num_layers
-        
-        self.lstm = nn.LSTM(
-            input_dim,
-            hidden_dim,
-            num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0
-        )
+class PositionalEncoding(nn.Module):
+    """位置编码，捕捉时间序列中的位置信息"""
+    def __init__(self, d_model, max_len=100):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        if d_model > 1:
+            pe[:, 1::2] = torch.cos(position * div_term[:d_model//2])
+        self.register_buffer('pe', pe)
     
     def forward(self, x):
-        """
-        Args:
-            x: 输入序列，形状 (batch_size, seq_len, input_dim)
-        
-        Returns:
-            output: 最后一个时间步的输出，形状 (batch_size, hidden_dim)
-        """
-        lstm_out, (h_n, c_n) = self.lstm(x)
-        # 返回最后一个时间步的隐藏状态
-        return lstm_out[:, -1, :]
+        # x: (batch, seq_len, d_model)
+        return x + self.pe[:x.size(1), :].unsqueeze(0)
 
-class SISModel(nn.Module):
-    """SIS动力学模型"""
-    def __init__(self, num_cities, learnable_params=True):
-        super(SISModel, self).__init__()
+
+class TemporalConvBlock(nn.Module):
+    """时间卷积块，捕捉局部时间模式"""
+    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1):
+        super().__init__()
+        padding = (kernel_size - 1) * dilation // 2
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, 
+                             padding=padding, dilation=dilation)
+        self.norm = nn.LayerNorm(out_channels)
+        self.activation = nn.GELU()
+        
+    def forward(self, x):
+        # x: (batch, seq_len, channels)
+        x = x.transpose(1, 2)  # (batch, channels, seq_len)
+        x = self.conv(x)
+        x = x.transpose(1, 2)  # (batch, seq_len, channels)
+        x = self.norm(x)
+        x = self.activation(x)
+        return x
+
+
+class MultiScaleTemporalEncoder(nn.Module):
+    """多尺度时间编码器"""
+    def __init__(self, input_dim, hidden_dim=64, num_scales=3):
+        super().__init__()
+        self.num_scales = num_scales
+        
+        # 不同膨胀率的时间卷积
+        self.conv_layers = nn.ModuleList([
+            TemporalConvBlock(input_dim if i == 0 else hidden_dim, 
+                            hidden_dim, kernel_size=3, dilation=2**i)
+            for i in range(num_scales)
+        ])
+        
+        # 融合层
+        self.fusion = nn.Linear(hidden_dim * num_scales, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
+        
+    def forward(self, x):
+        # x: (batch, seq_len, input_dim)
+        outputs = []
+        h = x
+        for conv in self.conv_layers:
+            h = conv(h)
+            outputs.append(h)
+        
+        # 拼接不同尺度的输出
+        multi_scale = torch.cat(outputs, dim=-1)
+        out = self.fusion(multi_scale)
+        out = self.norm(out)
+        return out
+
+
+class SpatialAttention(nn.Module):
+    """空间注意力模块（简化版GAT）"""
+    def __init__(self, in_dim, out_dim, num_heads=4):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = out_dim // num_heads
+        
+        self.query = nn.Linear(in_dim, out_dim)
+        self.key = nn.Linear(in_dim, out_dim)
+        self.value = nn.Linear(in_dim, out_dim)
+        self.out_proj = nn.Linear(out_dim, out_dim)
+        self.norm = nn.LayerNorm(out_dim)
+        
+    def forward(self, x, adj_mask=None):
+        # x: (batch, num_nodes, in_dim)
+        batch_size, num_nodes, _ = x.shape
+        
+        Q = self.query(x).view(batch_size, num_nodes, self.num_heads, self.head_dim)
+        K = self.key(x).view(batch_size, num_nodes, self.num_heads, self.head_dim)
+        V = self.value(x).view(batch_size, num_nodes, self.num_heads, self.head_dim)
+        
+        # (batch, heads, nodes, head_dim)
+        Q = Q.permute(0, 2, 1, 3)
+        K = K.permute(0, 2, 1, 3)
+        V = V.permute(0, 2, 1, 3)
+        
+        # 注意力分数
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        
+        # 应用邻接掩码（如果有）
+        if adj_mask is not None:
+            scores = scores.masked_fill(adj_mask == 0, float('-inf'))
+        
+        attn = F.softmax(scores, dim=-1)
+        attn = F.dropout(attn, p=0.1, training=self.training)
+        
+        out = torch.matmul(attn, V)
+        out = out.permute(0, 2, 1, 3).contiguous().view(batch_size, num_nodes, -1)
+        out = self.out_proj(out)
+        out = self.norm(out + x[:, :, :out.size(-1)] if x.size(-1) == out.size(-1) else out)
+        
+        return out
+
+
+class ImprovedSpatialGCN(nn.Module):
+    """改进的空间图卷积模块"""
+    def __init__(self, in_dim, hidden_dim, out_dim, num_layers=2, dropout=0.1):
+        super().__init__()
+        
+        self.input_proj = nn.Linear(in_dim, hidden_dim)
+        
+        # 使用多层空间注意力
+        self.layers = nn.ModuleList([
+            SpatialAttention(hidden_dim, hidden_dim, num_heads=4)
+            for _ in range(num_layers)
+        ])
+        
+        self.output_proj = nn.Linear(hidden_dim, out_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(out_dim)
+        
+    def forward(self, x, edge_index=None):
+        # x: (batch, num_nodes, in_dim)
+        h = self.input_proj(x)
+        h = F.gelu(h)
+        
+        for layer in self.layers:
+            h = layer(h)
+            h = self.dropout(h)
+        
+        out = self.output_proj(h)
+        out = self.norm(out)
+        return out
+
+
+class TemporalAttention(nn.Module):
+    """时间注意力，关注重要的历史时间步"""
+    def __init__(self, hidden_dim, num_heads=4):
+        super().__init__()
+        self.attention = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True, dropout=0.1)
+        self.norm = nn.LayerNorm(hidden_dim)
+        
+    def forward(self, x):
+        # x: (batch, seq_len, hidden_dim)
+        attn_out, _ = self.attention(x, x, x)
+        out = self.norm(x + attn_out)
+        return out
+
+
+class ImprovedTemporalEncoder(nn.Module):
+    """改进的时间编码器：CNN + LSTM + Attention"""
+    def __init__(self, input_dim, hidden_dim=128, num_layers=2, dropout=0.1):
+        super().__init__()
+        
+        # 多尺度卷积
+        self.multi_scale_conv = MultiScaleTemporalEncoder(input_dim, hidden_dim // 2, num_scales=3)
+        
+        # 位置编码
+        self.pos_encoding = PositionalEncoding(hidden_dim // 2)
+        
+        # LSTM
+        self.lstm = nn.LSTM(
+            hidden_dim // 2, hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0,
+            bidirectional=False
+        )
+        
+        # 时间注意力
+        self.temporal_attn = TemporalAttention(hidden_dim, num_heads=4)
+        
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x):
+        # x: (batch, seq_len, input_dim)
+        
+        # 多尺度卷积
+        h = self.multi_scale_conv(x)
+        
+        # 位置编码
+        h = self.pos_encoding(h)
+        
+        # LSTM
+        lstm_out, (h_n, c_n) = self.lstm(h)
+        
+        # 时间注意力
+        attn_out = self.temporal_attn(lstm_out)
+        
+        # 返回最后时间步
+        out = attn_out[:, -1, :]
+        out = self.dropout(out)
+        
+        return out
+
+
+class SISRegularizer(nn.Module):
+    """改进的SIS正则化模块"""
+    def __init__(self, num_cities, learnable=True):
+        super().__init__()
         self.num_cities = num_cities
-        self.learnable_params = learnable_params
         
-        if learnable_params:
-            # 可学习的参数（每个城市可以有不同的参数）
-            self.beta = nn.Parameter(torch.ones(num_cities) * 0.1)  # 感染率
-            self.gamma = nn.Parameter(torch.ones(num_cities) * 0.05)  # 恢复率
+        if learnable:
+            # 使用更合理的初始值和约束
+            self.log_beta = nn.Parameter(torch.zeros(num_cities))  # log空间确保正值
+            self.log_gamma = nn.Parameter(torch.zeros(num_cities) - 1)  # gamma通常较小
         else:
-            # 固定参数
-            self.register_buffer('beta', torch.ones(num_cities) * 0.1)
-            self.register_buffer('gamma', torch.ones(num_cities) * 0.05)
+            self.register_buffer('log_beta', torch.zeros(num_cities))
+            self.register_buffer('log_gamma', torch.zeros(num_cities) - 1)
     
-    def forward(self, I_t, N=1.0):
+    @property
+    def beta(self):
+        return torch.sigmoid(self.log_beta) * 0.5  # 限制在[0, 0.5]
+    
+    @property
+    def gamma(self):
+        return torch.sigmoid(self.log_gamma) * 0.3  # 限制在[0, 0.3]
+    
+    def forward(self, I_t, population_scale=100.0):
         """
-        SIS模型前向传播
-        
-        Args:
-            I_t: 当前感染比例，形状 (batch_size, num_cities) 或 (num_cities,)
-            N: 总人口（归一化为1）
-        
-        Returns:
-            I_t1: 下一时间步的感染比例，形状与I_t相同
+        SIS动力学预测
+        I_t: (batch, num_cities) 当前感染数
         """
-        if I_t.dim() == 1:
-            I_t = I_t.unsqueeze(0)
-            squeeze = True
-        else:
-            squeeze = False
+        # 归一化到[0, 1]范围
+        I_normalized = I_t / population_scale
+        I_normalized = torch.clamp(I_normalized, 0, 1)
         
-        batch_size, num_cities = I_t.shape
+        S_normalized = 1 - I_normalized
         
-        # 扩展参数维度
-        beta = self.beta.unsqueeze(0).expand(batch_size, -1)  # (batch, num_cities)
-        gamma = self.gamma.unsqueeze(0).expand(batch_size, -1)  # (batch, num_cities)
+        # SIS方程
+        new_infections = self.beta * S_normalized * I_normalized
+        recoveries = self.gamma * I_normalized
         
-        # SIS动力学方程
-        # I_{t+1} = I_t + beta * (N - I_t) * I_t / N - gamma * I_t
-        S_t = N - I_t  # 易感者比例
-        new_infections = beta * S_t * I_t / N
-        recoveries = gamma * I_t
+        I_next_normalized = I_normalized + new_infections - recoveries
+        I_next_normalized = torch.clamp(I_next_normalized, 0, 1)
         
-        I_t1 = I_t + new_infections - recoveries
-        I_t1 = torch.clamp(I_t1, min=0.0, max=N)  # 确保在合理范围内
+        # 反归一化
+        I_next = I_next_normalized * population_scale
         
-        if squeeze:
-            I_t1 = I_t1.squeeze(0)
-        
-        return I_t1
+        return I_next
 
-class EpidemiologyGNN(nn.Module):
-    """完整的流行病学知识增强的时空图神经网络"""
+
+class EpidemiologyGNNv2(nn.Module):
+    """
+    改进版流行病学知识增强的时空图神经网络
+    
+    改进点：
+    1. 多尺度时间建模
+    2. 空间注意力机制
+    3. 残差连接
+    4. 更好的特征工程
+    5. 输出非负约束
+    """
     def __init__(
         self,
         num_cities,
-        gcn_hidden_dim=64,
-        gcn_num_layers=2,
-        lstm_hidden_dim=128,
-        lstm_num_layers=2,
-        dropout=0.1,
-        use_sis=True,
-        learnable_sis_params=True
+        window_size=14,
+        spatial_hidden_dim=64,
+        temporal_hidden_dim=128,
+        num_spatial_layers=2,
+        num_temporal_layers=2,
+        dropout=0.2,
+        use_sis=True
     ):
-        super(EpidemiologyGNN, self).__init__()
+        super().__init__()
         
         self.num_cities = num_cities
+        self.window_size = window_size
         self.use_sis = use_sis
         
-        # 空间建模：GCN
-        self.spatial_gcn = SpatialGCN(
-            num_nodes=num_cities,
-            hidden_dim=gcn_hidden_dim,
-            num_layers=gcn_num_layers
+        # 输入特征工程：将单一病例数扩展为多维特征
+        self.feature_dim = 8  # 扩展的特征维度
+        self.feature_encoder = nn.Sequential(
+            nn.Linear(1, 32),
+            nn.GELU(),
+            nn.Linear(32, self.feature_dim),
+            nn.LayerNorm(self.feature_dim)
         )
         
-        # 时间建模：LSTM
-        self.temporal_lstm = TemporalLSTM(
-            input_dim=gcn_hidden_dim,
-            hidden_dim=lstm_hidden_dim,
-            num_layers=lstm_num_layers,
+        # 空间编码器
+        self.spatial_encoder = ImprovedSpatialGCN(
+            in_dim=self.feature_dim,
+            hidden_dim=spatial_hidden_dim,
+            out_dim=spatial_hidden_dim,
+            num_layers=num_spatial_layers,
             dropout=dropout
         )
         
-        # 输出层
-        self.output_layer = nn.Sequential(
-            nn.Linear(lstm_hidden_dim, 64),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(64, 1)
+        # 时间编码器（每个城市共享）
+        self.temporal_encoder = ImprovedTemporalEncoder(
+            input_dim=spatial_hidden_dim,
+            hidden_dim=temporal_hidden_dim,
+            num_layers=num_temporal_layers,
+            dropout=dropout
         )
         
-        # SIS模型（用于正则化）
+        # 输出头
+        self.output_head = nn.Sequential(
+            nn.Linear(temporal_hidden_dim, temporal_hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(temporal_hidden_dim // 2, 32),
+            nn.GELU(),
+            nn.Linear(32, 1)
+        )
+        
+        # 残差连接：从输入直接连到输出
+        self.residual_weight = nn.Parameter(torch.tensor(0.1))
+        
+        # SIS正则化
         if use_sis:
-            self.sis_model = SISModel(
-                num_cities=num_cities,
-                learnable_params=learnable_sis_params
-            )
+            self.sis_model = SISRegularizer(num_cities, learnable=True)
+        
+        # 初始化权重
+        self._init_weights()
     
-    def forward(self, x, edge_index, return_sis=False):
+    def _init_weights(self):
+        """初始化权重"""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LSTM):
+                for name, param in m.named_parameters():
+                    if 'weight' in name:
+                        nn.init.orthogonal_(param)
+                    elif 'bias' in name:
+                        nn.init.zeros_(param)
+    
+    def forward(self, x, edge_index=None, return_sis=False):
         """
         前向传播
         
         Args:
-            x: 输入序列，形状 (batch_size, window_size, num_cities)
-            edge_index: 边索引，形状 (2, num_edges)
+            x: (batch, window_size, num_cities) 输入序列
+            edge_index: 图边索引（可选，当前使用全连接注意力）
             return_sis: 是否返回SIS预测
         
         Returns:
-            predictions: 预测值，形状 (batch_size, num_cities)
-            sis_predictions: SIS预测（如果return_sis=True）
+            predictions: (batch, num_cities) 预测值
+            sis_predictions: SIS模型预测（如果return_sis=True）
         """
         batch_size, window_size, num_cities = x.shape
         
-        # 优化：对每个时间步进行空间建模（批量处理）
-        spatial_embeddings = []
+        # 1. 特征工程：扩展输入特征
+        # (batch, window_size, num_cities) -> (batch, window_size, num_cities, feature_dim)
+        x_expanded = x.unsqueeze(-1)  # (batch, window_size, num_cities, 1)
+        x_features = self.feature_encoder(x_expanded)  # (batch, window_size, num_cities, feature_dim)
+        
+        # 2. 时空建模
+        spatial_temporal_features = []
         for t in range(window_size):
-            x_t = x[:, t, :].unsqueeze(-1)  # (batch, num_cities, 1)
-            # 直接对整个批次处理GCN（已优化SpatialGCN支持批次处理）
-            h_t = self.spatial_gcn(x_t, edge_index)  # (batch, num_cities, gcn_hidden_dim)
-            spatial_embeddings.append(h_t)
+            # 空间建模：(batch, num_cities, feature_dim)
+            spatial_out = self.spatial_encoder(x_features[:, t, :, :])
+            spatial_temporal_features.append(spatial_out)
         
-        # 堆叠为序列 (batch, window_size, num_cities, gcn_hidden_dim)
-        spatial_embeddings = torch.stack(spatial_embeddings, dim=1)
+        # (batch, window_size, num_cities, spatial_hidden_dim)
+        spatial_temporal_features = torch.stack(spatial_temporal_features, dim=1)
         
-        # 优化：批量处理所有城市的时间建模
-        # 重塑为 (batch * num_cities, window_size, gcn_hidden_dim)
-        spatial_reshaped = spatial_embeddings.view(batch_size * num_cities, window_size, -1)
-        # 批量处理所有城市
-        temporal_all = self.temporal_lstm(spatial_reshaped)  # (batch * num_cities, lstm_hidden_dim)
-        # 重塑回 (batch, num_cities, lstm_hidden_dim)
-        temporal_embeddings = temporal_all.view(batch_size, num_cities, -1)
+        # 3. 时间建模（每个城市）
+        # 重塑为 (batch * num_cities, window_size, spatial_hidden_dim)
+        temporal_input = spatial_temporal_features.permute(0, 2, 1, 3)  # (batch, num_cities, window_size, dim)
+        temporal_input = temporal_input.reshape(batch_size * num_cities, window_size, -1)
         
-        # 输出层
-        predictions = self.output_layer(temporal_embeddings)  # (batch, num_cities, 1)
-        predictions = predictions.squeeze(-1)  # (batch, num_cities)
+        temporal_out = self.temporal_encoder(temporal_input)  # (batch * num_cities, temporal_hidden_dim)
+        temporal_out = temporal_out.view(batch_size, num_cities, -1)  # (batch, num_cities, temporal_hidden_dim)
         
-        # SIS预测（用于正则化）
+        # 4. 输出预测
+        predictions = self.output_head(temporal_out).squeeze(-1)  # (batch, num_cities)
+        
+        # 5. 残差连接：加上最后一个时间步的输入
+        last_input = x[:, -1, :]  # (batch, num_cities)
+        predictions = predictions + self.residual_weight * last_input
+        
+        # 6. 确保非负输出
+        predictions = F.softplus(predictions)  # 使用softplus确保正值且平滑
+        
+        # 7. SIS预测
         sis_predictions = None
         if self.use_sis and return_sis:
-            # 使用最后一个时间步的输入作为当前状态
-            I_t = x[:, -1, :]  # (batch, num_cities)
-            # 将病例数转换为比例（使用滑动平均作为人口估计）
-            # 使用过去窗口的平均值作为基准，避免除零
-            I_t_mean = x.mean(dim=1)  # (batch, num_cities) 过去窗口的平均值
-            # 归一化：使用当前值相对于历史平均值的比例
-            # 添加小的平滑项避免极端值
-            normalization_factor = torch.clamp(I_t_mean, min=1.0)
-            I_t_normalized = I_t / normalization_factor
-            # 限制在合理范围内 [0, 10]（允许短期爆发）
-            I_t_normalized = torch.clamp(I_t_normalized, min=0.0, max=10.0)
-            
-            # SIS模型预测
-            sis_predictions_normalized = self.sis_model(I_t_normalized)
-            
-            # 反归一化回病例数
-            sis_predictions = sis_predictions_normalized * normalization_factor
+            sis_predictions = self.sis_model(last_input)
         
         if return_sis:
             return predictions, sis_predictions
-        else:
-            return predictions
+        return predictions
+
 
 def create_fully_connected_graph(num_nodes):
-    """
-    创建全连接图的边索引
-    
-    Args:
-        num_nodes: 节点数量
-    
-    Returns:
-        edge_index: 形状 (2, num_edges) 的边索引
-    """
+    """创建全连接图的边索引"""
     edges = []
     for i in range(num_nodes):
         for j in range(num_nodes):
-            if i != j:  # 不包括自环
+            if i != j:
                 edges.append([i, j])
-    
     edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
     return edge_index
 
+
+# 测试代码
+if __name__ == "__main__":
+    # 测试模型
+    batch_size = 32
+    window_size = 14
+    num_cities = 22
+    
+    model = EpidemiologyGNNv2(
+        num_cities=num_cities,
+        window_size=window_size,
+        spatial_hidden_dim=64,
+        temporal_hidden_dim=128,
+        num_spatial_layers=2,
+        num_temporal_layers=2,
+        dropout=0.2,
+        use_sis=True
+    )
+    
+    # 测试输入
+    x = torch.randn(batch_size, window_size, num_cities).abs()  # 确保非负
+    edge_index = create_fully_connected_graph(num_cities)
+    
+    # 前向传播
+    predictions, sis_pred = model(x, edge_index, return_sis=True)
+    
+    print(f"输入形状: {x.shape}")
+    print(f"预测形状: {predictions.shape}")
+    print(f"SIS预测形状: {sis_pred.shape}")
+    print(f"模型参数量: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"预测值范围: [{predictions.min().item():.4f}, {predictions.max().item():.4f}]")

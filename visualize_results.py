@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import os
 from tqdm import tqdm
-from model_v2 import EpidemiologyGNNv2, create_fully_connected_graph
+from model import EpidemiologyGNNv2, create_fully_connected_graph
 import pandas as pd
 
 # 设置matplotlib样式
@@ -23,7 +23,7 @@ plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'sans-serif']
 plt.rcParams['axes.unicode_minus'] = False
 
 # 输出文件夹
-OUTPUT_DIR = 'visualization_results_v2'
+OUTPUT_DIR = 'visualization_results'
 
 # 批量推理配置 - 针对高显存GPU优化
 BATCH_SIZE = 2048  # 5090有30G+显存，可以用很大的batch
@@ -548,7 +548,7 @@ def main():
     print(f"使用设备: {device}")
     
     print("\n正在加载模型（v2版本）...")
-    model, data, config, transformer = load_model('checkpoints_v2/best_model.pth', device)
+    model, data, config, transformer = load_model('checkpoints/best_model.pth', device)
     
     cities = data['cities']
     test_X = data['test_X']
